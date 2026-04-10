@@ -8,7 +8,6 @@ use std::sync::Arc;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-use auth::CopilotAuth;
 use copilot::CopilotClient;
 
 /// Shared application state.

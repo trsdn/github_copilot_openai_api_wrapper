@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.0] – 2025-04-10
+
+### Added
+- **`/responses` API routing** — models that only support the Copilot `/responses` endpoint
+  (`gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.2-codex`, `goldeneye`) are now automatically
+  routed to `/responses` and translated back to the standard OpenAI `chat/completions` format
+  (both streaming and non-streaming)
+- `RESPONSES_ONLY_MODELS` constant in `src/copilot.rs` documents which models need special routing
+- **`max_tokens` normalisation** — incoming `max_tokens` is forwarded as `max_completion_tokens`
+  for `/chat/completions` requests to match what the Copilot API expects for newer models
+
+### Fixed
+- `/responses` API enforces a minimum of 50 for `max_output_tokens`; requests with a smaller
+  value are now silently clamped to 50 instead of returning a 400 error
+
+### Changed
+- `chat_completions_stream()` return type changed to `Pin<Box<dyn Stream<Item=String> + Send>>`
+  to support both `/chat/completions` and `/responses` streaming code paths
+- Pre-built Linux (`x86_64-unknown-linux-musl`, static) binary added to GitHub release assets
+
 ## [0.2.0] – 2026-03-20
 
 ### Added
