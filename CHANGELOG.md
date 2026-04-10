@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.1] – 2025-04-10
+
+### Fixed
+- **`/responses` content empty for reasoning models** — the `/responses` API prepends a
+  `{type:"reasoning"}` item before the actual message output for chain-of-thought models.
+  The parser now finds the first `{type:"message"}` item instead of blindly using `arr[0]`,
+  so `choices[0].message.content` is no longer empty despite tokens being generated
+- **`temperature`/`top_p` cause HTTP 400** — these parameters are not accepted by `/responses`-only
+  models (`gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.2-codex`, `goldeneye`) and are now stripped
+  before forwarding to the `/responses` endpoint
+
 ## [0.3.0] – 2025-04-10
 
 ### Added
