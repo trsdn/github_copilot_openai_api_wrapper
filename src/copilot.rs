@@ -278,11 +278,8 @@ fn to_responses_payload(payload: &Value, stream: bool) -> Value {
         let n = v.as_u64().unwrap_or(50).max(50);
         out["max_output_tokens"] = Value::Number(n.into());
     }
-    for key in &["temperature", "top_p"] {
-        if let Some(v) = payload.get(key) {
-            out[*key] = v.clone();
-        }
-    }
+    // Note: temperature and top_p are NOT supported by /responses models (e.g. gpt-5.4-mini)
+    // Do not forward them to avoid 400 errors.
     out["stream"] = Value::Bool(stream);
     out
 }
