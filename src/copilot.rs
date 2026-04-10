@@ -220,7 +220,9 @@ impl CopilotClient {
             return Err(format!("Copilot API error (HTTP {status}): {body}"));
         }
 
-        let raw: Value = resp.json().await.map_err(|e| format!("JSON parse error: {e}"))?;
+        let body_text = resp.text().await.map_err(|e| format!("Read error: {e}"))?;
+        tracing::debug!(body = %body_text, "raw /responses response");
+        let raw: Value = serde_json::from_str(&body_text).map_err(|e| format!("JSON parse error: {e}: body={}", &body_text[..body_text.len().min(200)]))?;
         Ok(from_responses_response(raw, &model))
     }
 
@@ -291,7 +293,7 @@ fn from_responses_response(resp: Value, model: &str) -> Value {
     let resp_model = resp["model"].as_str().unwrap_or(model).to_string();
     let content = resp["output"]
         .as_array()
-        .and_then(|arr| arr.first())
+        .and_then(|arr| arr.iter().find(|item| item["type"].as_str() == Some("message")))
         .and_then(|item| item["content"].as_array())
         .and_then(|arr| arr.first())
         .and_then(|part| part["text"].as_str())
@@ -460,4 +462,79 @@ fn async_stream(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod responses_tests {
+    use super::*;
+
+    #[test]
+    fn test_from_responses_response_parses_content() {
+        // Simple case: single message output
+        let resp = serde_json::json!({
+            "id": "abc123",
+            "created_at": 1234567890u64,
+            "model": "gpt-5.4-mini-2026-03-17",
+            "output": [{
+                "content": [{"text": "PONG", "type": "output_text", "annotations": [], "logprobs": []}],
+                "id": "item1",
+                "phase": "final_answer",
+                "role": "assistant",
+                "status": "completed",
+                "type": "message"
+            }],
+            "usage": {"input_tokens": 9, "output_tokens": 6, "total_tokens": 15}
+        });
+        let result = from_responses_response(resp, "gpt-5.4-mini");
+        let content = result["choices"][0]["message"]["content"].as_str().unwrap_or("MISSING");
+        assert_eq!(content, "PONG", "content should be PONG, got: {content}");
+        assert_eq!(result["usage"]["completion_tokens"].as_u64(), Some(6));
+    }
+
+    #[test]
+    fn test_from_responses_response_skips_reasoning_item() {
+        // Reasoning models prepend a reasoning item before the message item.
+        // The parser must skip it and find the "message" type item.
+        let resp = serde_json::json!({
+            "id": "abc123",
+            "created_at": 1234567890u64,
+            "model": "gpt-5.4-mini-2026-03-17",
+            "output": [
+                {
+                    "id": "reasoning1",
+                    "summary": [],
+                    "type": "reasoning"
+                },
+                {
+                    "content": [{"text": "Paris is great.", "type": "output_text", "annotations": [], "logprobs": []}],
+                    "id": "msg1",
+                    "phase": "final_answer",
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message"
+                }
+            ],
+            "usage": {"input_tokens": 13, "output_tokens": 64, "total_tokens": 77}
+        });
+        let result = from_responses_response(resp, "gpt-5.4-mini");
+        let content = result["choices"][0]["message"]["content"].as_str().unwrap_or("MISSING");
+        assert_eq!(content, "Paris is great.", "should skip reasoning item");
+        assert_eq!(result["usage"]["completion_tokens"].as_u64(), Some(64));
+    }
+
+    #[test]
+    fn test_to_responses_payload_strips_temperature() {
+        let payload = serde_json::json!({
+            "model": "gpt-5.4-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_tokens": 100
+        });
+        let out = to_responses_payload(&payload, false);
+        assert!(out.get("temperature").is_none(), "temperature should be stripped");
+        assert!(out.get("top_p").is_none(), "top_p should be stripped");
+        assert_eq!(out["max_output_tokens"].as_u64(), Some(100));
+        assert_eq!(out["input"], payload["messages"]);
+    }
 }
