@@ -1,5 +1,9 @@
 /// HTTP client for the GitHub Copilot Chat API.
+use std::io::Cursor;
+
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
 use reqwest::Client;
 use serde_json::Value;
 
@@ -8,6 +12,9 @@ use crate::auth::CopilotAuth;
 const COPILOT_CHAT_URL: &str = "https://api.githubcopilot.com/chat/completions";
 const COPILOT_MODELS_URL: &str = "https://api.githubcopilot.com/models";
 const COPILOT_RESPONSES_URL: &str = "https://api.githubcopilot.com/responses";
+const INLINE_IMAGE_MAX_DIMENSION: u32 = 1536;
+const INLINE_IMAGE_REENCODE_THRESHOLD_BYTES: usize = 512 * 1024;
+const INLINE_IMAGE_JPEG_QUALITY: u8 = 80;
 
 /// Models that Copilot only exposes via /responses, not /chat/completions.
 /// Detected by checking `supported_endpoints` in the models list.
@@ -91,6 +98,11 @@ impl CopilotClient {
 
     /// Non-streaming chat completion — returns raw JSON value.
     pub async fn chat_completions(&self, payload: &mut Value) -> Result<Value, String> {
+        let compressed_images = compress_inline_images(payload);
+        if compressed_images > 0 {
+            tracing::info!(compressed_images, "compressed inline image payloads");
+        }
+
         let model = payload["model"].as_str().unwrap_or("").to_string();
         if is_responses_only(&model) {
             return self.chat_completions_via_responses(payload).await;
@@ -124,6 +136,11 @@ impl CopilotClient {
         &self,
         mut payload: Value,
     ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = String> + Send>>, String> {
+        let compressed_images = compress_inline_images(&mut payload);
+        if compressed_images > 0 {
+            tracing::info!(compressed_images, "compressed inline image payloads");
+        }
+
         let model = payload["model"].as_str().unwrap_or("").to_string();
         if is_responses_only(&model) {
             let s = self.chat_completions_stream_via_responses(payload).await?;
@@ -263,6 +280,65 @@ impl CopilotClient {
 
 fn is_responses_only(model: &str) -> bool {
     RESPONSES_ONLY_MODELS.contains(&model)
+}
+
+fn compress_inline_images(value: &mut Value) -> usize {
+    match value {
+        Value::Object(map) => map
+            .values_mut()
+            .map(compress_inline_images)
+            .sum(),
+        Value::Array(items) => items
+            .iter_mut()
+            .map(compress_inline_images)
+            .sum(),
+        Value::String(text) if text.starts_with("data:image/") => {
+            if let Some(compressed) = compress_data_url_image(text) {
+                *text = compressed;
+                1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn compress_data_url_image(data_url: &str) -> Option<String> {
+    let (header, encoded) = data_url.split_once(";base64,")?;
+    if !header.starts_with("data:image/") {
+        return None;
+    }
+
+    let image_bytes = BASE64_STANDARD.decode(encoded).ok()?;
+    let image = image::load_from_memory(&image_bytes).ok()?;
+    let width = image.width();
+    let height = image.height();
+
+    if image_bytes.len() <= INLINE_IMAGE_REENCODE_THRESHOLD_BYTES
+        && width <= INLINE_IMAGE_MAX_DIMENSION
+        && height <= INLINE_IMAGE_MAX_DIMENSION
+        && header == "data:image/jpeg"
+    {
+        return None;
+    }
+
+    let resized = image.resize(
+        INLINE_IMAGE_MAX_DIMENSION,
+        INLINE_IMAGE_MAX_DIMENSION,
+        FilterType::Lanczos3,
+    );
+    let mut output = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(
+        Cursor::new(&mut output),
+        INLINE_IMAGE_JPEG_QUALITY,
+    );
+    encoder.encode_image(&resized.to_rgb8()).ok()?;
+
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        BASE64_STANDARD.encode(output)
+    ))
 }
 
 /// Translate a chat/completions payload into a /responses API payload.
@@ -440,10 +516,11 @@ fn async_stream(
                         if data == "[DONE]" {
                             return Some(("data: [DONE]\n\n".to_string(), (stream, buf)));
                         }
-                        // Validate JSON
-                        if serde_json::from_str::<Value>(data).is_ok() {
+                        // Validate and normalize JSON chunks for OpenAI-compatible clients.
+                        if let Ok(mut event) = serde_json::from_str::<Value>(data) {
+                            normalize_chat_stream_chunk(&mut event);
                             return Some((
-                                format!("data: {data}\n\n"),
+                                format!("data: {}\n\n", event),
                                 (stream, buf),
                             ));
                         }
@@ -462,6 +539,35 @@ fn async_stream(
             }
         },
     )
+}
+
+fn normalize_chat_stream_chunk(event: &mut Value) {
+    let Some(choices) = event.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for choice in choices {
+        let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) else {
+            continue;
+        };
+
+        let has_content = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty());
+        if has_content {
+            continue;
+        }
+
+        let fallback_content = delta
+            .get("reasoning_text")
+            .and_then(Value::as_str)
+            .filter(|content| !content.is_empty())
+            .map(str::to_owned);
+        if let Some(content) = fallback_content {
+            delta.insert("content".to_string(), Value::String(content));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -536,5 +642,89 @@ mod responses_tests {
         assert!(out.get("top_p").is_none(), "top_p should be stripped");
         assert_eq!(out["max_output_tokens"].as_u64(), Some(100));
         assert_eq!(out["input"], payload["messages"]);
+    }
+
+    #[test]
+    fn test_compress_inline_images_resizes_large_data_url() {
+        let image = image::RgbImage::from_pixel(
+            2400,
+            1800,
+            image::Rgb([240, 240, 240]),
+        );
+        let mut original_bytes = Vec::new();
+        JpegEncoder::new_with_quality(Cursor::new(&mut original_bytes), 95)
+            .encode_image(&image)
+            .unwrap();
+        let original_url = format!(
+            "data:image/jpeg;base64,{}",
+            BASE64_STANDARD.encode(&original_bytes)
+        );
+
+        let mut payload = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": original_url}
+                }]
+            }]
+        });
+
+        assert_eq!(compress_inline_images(&mut payload), 1);
+        let compressed_url = payload["messages"][0]["content"][0]["image_url"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(compressed_url.starts_with("data:image/jpeg;base64,"));
+
+        let encoded = compressed_url
+            .split_once(";base64,")
+            .unwrap()
+            .1;
+        let compressed_bytes = BASE64_STANDARD.decode(encoded).unwrap();
+        let compressed_image = image::load_from_memory(&compressed_bytes).unwrap();
+
+        assert!(compressed_image.width() <= INLINE_IMAGE_MAX_DIMENSION);
+        assert!(compressed_image.height() <= INLINE_IMAGE_MAX_DIMENSION);
+        assert!(compressed_bytes.len() < original_bytes.len());
+    }
+
+    #[test]
+    fn test_normalize_chat_stream_chunk_maps_reasoning_text_to_content() {
+        let mut event = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": "",
+                    "reasoning_text": "Hallo"
+                },
+                "index": 0
+            }]
+        });
+
+        normalize_chat_stream_chunk(&mut event);
+
+        assert_eq!(
+            event["choices"][0]["delta"]["content"].as_str(),
+            Some("Hallo")
+        );
+    }
+
+    #[test]
+    fn test_normalize_chat_stream_chunk_keeps_existing_content() {
+        let mut event = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": "Visible",
+                    "reasoning_text": "Hidden"
+                },
+                "index": 0
+            }]
+        });
+
+        normalize_chat_stream_chunk(&mut event);
+
+        assert_eq!(
+            event["choices"][0]["delta"]["content"].as_str(),
+            Some("Visible")
+        );
     }
 }

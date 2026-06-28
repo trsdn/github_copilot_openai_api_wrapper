@@ -5,7 +5,7 @@ pub mod models;
 pub mod routes;
 
 use std::sync::Arc;
-use axum::Router;
+use axum::{extract::DefaultBodyLimit, Router};
 use tower_http::cors::CorsLayer;
 
 use copilot::CopilotClient;
@@ -19,6 +19,7 @@ pub struct AppState {
 pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(routes::router())
+    .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
