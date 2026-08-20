@@ -26,7 +26,7 @@ tokio-stream = "0.1"
 bytes = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "signal", "test-util"] }
