@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 tokio-stream = "0.1"
 bytes = "1"
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
